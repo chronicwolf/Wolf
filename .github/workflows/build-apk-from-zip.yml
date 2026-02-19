@@ -19,28 +19,51 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Unzip project + patch Material dependency
+      - name: Unzip project + patch build fixes
         run: |
+          set -euxo pipefail
+
           sudo apt-get update
           sudo apt-get install -y unzip
 
+          # Pick ZIP (prefer exact expected name)
           if [ -f "ClientTrackerProject.zip" ]; then
             ZIP="ClientTrackerProject.zip"
           else
-            ZIP=$(ls -1 *.zip | head -n 1)
+            ZIP="$(ls -1 *.zip | head -n 1)"
           fi
 
           echo "Using ZIP: $ZIP"
           unzip -q "$ZIP"
 
-          # Ensure Gradle wrapper is executable
+          # Ensure Gradle wrapper executable
           chmod +x ClientTracker/gradlew
 
-          # Patch missing Material Components dependency (fixes Theme.Material3.* not found)
+          # Suppress compileSdk 36 warning (warning only)
+          echo "android.suppressUnsupportedCompileSdk=36" >> ClientTracker/gradle.properties
+
+          # Fix: Theme.Material3.DayNight.NoActionBar not found (Material Components dependency)
           APP_GRADLE="ClientTracker/app/build.gradle.kts"
           if [ -f "$APP_GRADLE" ] && ! grep -q 'com.google.android.material:material' "$APP_GRADLE"; then
             echo "Patching Material dependency into $APP_GRADLE"
             sed -i '/^[[:space:]]*dependencies[[:space:]]*{/a\    implementation("com.google.android.material:material:1.12.0")' "$APP_GRADLE"
+          fi
+
+          # Fix: Unresolved reference KeyboardOptions in SettingsScreen.kt (missing imports in ZIP)
+          SETTINGS_FILE="ClientTracker/app/src/main/java/com/wolf/clienttracker/ui/screens/SettingsScreen.kt"
+          if [ -f "$SETTINGS_FILE" ]; then
+            if grep -q 'KeyboardOptions' "$SETTINGS_FILE" && ! grep -q 'import androidx.compose.ui.text.input.KeyboardOptions' "$SETTINGS_FILE"; then
+              echo "Patching import KeyboardOptions into SettingsScreen.kt"
+              sed -i '/^package /a\
+\
+import androidx.compose.ui.text.input.KeyboardOptions' "$SETTINGS_FILE"
+            fi
+            if grep -q 'KeyboardType' "$SETTINGS_FILE" && ! grep -q 'import androidx.compose.ui.text.input.KeyboardType' "$SETTINGS_FILE"; then
+              echo "Patching import KeyboardType into SettingsScreen.kt"
+              sed -i '/^package /a\
+\
+import androidx.compose.ui.text.input.KeyboardType' "$SETTINGS_FILE"
+            fi
           fi
 
       - name: Unit tests
