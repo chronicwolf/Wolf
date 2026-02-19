@@ -1,0 +1,179 @@
+name: Build APK from ZIP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Unzip project from repo ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y unzip python3
+
+          ZIP=""
+          if [ -f "ClientTrackerProject.zip" ]; then
+            ZIP="ClientTrackerProject.zip"
+          elif [ -f "ClientTrackerProject (1).zip" ]; then
+            ZIP="ClientTrackerProject (1).zip"
+          else
+            ZIP="$(ls -1 *.zip 2>/dev/null | head -n 1 || true)"
+          fi
+
+          if [ -z "$ZIP" ]; then
+            echo "❌ No .zip found in repo root."
+            ls -la
+            exit 1
+          fi
+
+          echo "✅ Using ZIP: $ZIP"
+          rm -rf _unzipped
+          mkdir -p _unzipped
+          unzip -q "$ZIP" -d _unzipped
+
+          # Auto-detect Android project root inside the zip
+          PROJECT_DIR="$(python3 - <<'PY'
+import pathlib
+
+root = pathlib.Path("_unzipped")
+candidates = []
+for p in root.rglob("settings.gradle*"):
+    d = p.parent
+    score = 0
+    if (d / "gradlew").exists():
+        score += 2
+    if (d / "app" / "build.gradle").exists() or (d / "app" / "build.gradle.kts").exists():
+        score += 2
+    candidates.append((score, d))
+
+candidates.sort(key=lambda x: x[0], reverse=True)
+print(str(candidates[0][1]) if candidates else "")
+PY
+)"
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "❌ Could not locate Android project root inside zip."
+            find _unzipped -maxdepth 4 -type f -name "settings.gradle*" -print || true
+            exit 1
+          fi
+
+          echo "✅ Project root: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          chmod +x "$PROJECT_DIR/gradlew"
+
+      - name: Patch common build blockers (Material theme + KeyboardOptions)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          # Suppress compileSdk warnings if project uses 36 (safe even if not)
+          if [ -f "gradle.properties" ]; then
+            if ! grep -q '^android.suppressUnsupportedCompileSdk=' gradle.properties; then
+              echo "android.suppressUnsupportedCompileSdk=36" >> gradle.properties
+            fi
+          else
+            echo "android.suppressUnsupportedCompileSdk=36" > gradle.properties
+          fi
+
+          # Detect app gradle file
+          APP_GRADLE=""
+          if [ -f "app/build.gradle" ]; then APP_GRADLE="app/build.gradle"; fi
+          if [ -f "app/build.gradle.kts" ]; then APP_GRADLE="app/build.gradle.kts"; fi
+
+          if [ -z "$APP_GRADLE" ]; then
+            echo "❌ Missing app/build.gradle or app/build.gradle.kts"
+            ls -la app || true
+            exit 1
+          fi
+
+          echo "✅ Using $APP_GRADLE"
+
+          # Add Material Components (fixes Theme.Material3.DayNight.NoActionBar not found)
+          python3 - <<'PY'
+import pathlib, re
+
+path = pathlib.Path("app/build.gradle")
+kts = False
+if not path.exists():
+    path = pathlib.Path("app/build.gradle.kts")
+    kts = True
+
+txt = path.read_text(encoding="utf-8")
+
+# Stable release shown on mvnrepository list (avoid alpha in CI)
+material_dep = 'implementation("com.google.android.material:material:1.13.0")' if kts else 'implementation "com.google.android.material:material:1.13.0"'
+
+if "com.google.android.material:material" not in txt:
+    m = re.search(r"dependencies\s*\{", txt)
+    if not m:
+        raise SystemExit("No dependencies { } block found in app gradle file.")
+    insert_at = m.end()
+    txt = txt[:insert_at] + "\n    " + material_dep + txt[insert_at:]
+    print("✅ Added Material Components dependency")
+else:
+    print("ℹ️ Material Components dependency already present")
+
+path.write_text(txt, encoding="utf-8")
+PY
+
+          # Fix missing import for KeyboardOptions (often the real cause of 'Unresolved reference: KeyboardOptions')
+          if [ -d "app/src/main/java" ]; then
+            grep -RIlZ --include="*.kt" "KeyboardOptions" app/src/main/java | while IFS= read -r -d '' f; do
+              if ! grep -qE 'import\s+androidx\.compose\.foundation\.text\.KeyboardOptions' "$f" && \
+                 ! grep -qE 'import\s+androidx\.compose\.ui\.text\.input\.KeyboardOptions' "$f"; then
+                python3 - <<'PY' "$f"
+import sys, pathlib
+
+f = pathlib.Path(sys.argv[1])
+txt = f.read_text(encoding="utf-8")
+lines = txt.splitlines()
+
+out = []
+inserted = False
+for line in lines:
+    out.append(line)
+    if not inserted and line.startswith("package "):
+        out.append("import androidx.compose.foundation.text.KeyboardOptions")
+        inserted = True
+
+f.write_text("\n".join(out) + "\n", encoding="utf-8")
+print(f"✅ Inserted KeyboardOptions import into: {f}")
+PY
+              fi
+            done
+          fi
+
+      - name: Build Debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          ./gradlew --no-daemon clean assembleDebug
+
+      - name: Upload Debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
