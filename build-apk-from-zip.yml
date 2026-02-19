@@ -1,0 +1,198 @@
+name: Build APK from ZIP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Install unzip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip
+
+      - name: Unzip project and detect Gradle root
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Prefer the exact expected zip name. Otherwise pick the first .zip found.
+          if [ -f "ClientTrackerProject.zip" ]; then
+            ZIP="ClientTrackerProject.zip"
+          else
+            ZIP="$(ls -1 *.zip | head -n 1)"
+          fi
+
+          echo "Using ZIP: $ZIP"
+
+          rm -rf project
+          mkdir -p project
+          unzip -q "$ZIP" -d project
+
+          GRADLEW_PATH="$(find project -type f -name gradlew | head -n 1 || true)"
+          if [ -z "$GRADLEW_PATH" ]; then
+            echo "❌ Could not find gradlew inside the ZIP."
+            echo "Top folders:"
+            find project -maxdepth 3 -type d
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$GRADLEW_PATH")"
+          echo "Project dir: $PROJECT_DIR"
+
+          chmod +x "$PROJECT_DIR/gradlew"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Patch missing dependencies + fix KeyboardOptions import
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_GRADLE="$PROJECT_DIR/app/build.gradle.kts"
+          if [ ! -f "$APP_GRADLE" ]; then
+            echo "❌ Missing: $APP_GRADLE"
+            exit 1
+          fi
+
+          export APP_GRADLE
+
+          # 1) Ensure Material Components exists (fixes Theme.Material3.* not found in XML themes)
+          if ! grep -q 'com.google.android.material:material' "$APP_GRADLE"; then
+            echo "Adding Material Components dependency..."
+            python3 - <<'PY'
+import os, re, pathlib
+p = pathlib.Path(os.environ["APP_GRADLE"])
+txt = p.read_text(encoding="utf-8")
+
+m = re.search(r"dependencies\s*\{", txt)
+if not m:
+    raise SystemExit("No dependencies block found in app/build.gradle.kts")
+
+i = m.end()
+depth = 1
+j = i
+while j < len(txt) and depth > 0:
+    if txt[j] == "{": depth += 1
+    elif txt[j] == "}": depth -= 1
+    j += 1
+
+deps_block = txt[m.start():j]
+lines = deps_block.splitlines(True)
+
+insert = '    implementation("com.google.android.material:material:1.12.0")\n'
+
+# insert right after "dependencies {"
+for idx, line in enumerate(lines):
+    if "dependencies" in line and "{" in line:
+        lines.insert(idx + 1, insert)
+        break
+
+new_deps = "".join(lines)
+txt2 = txt[:m.start()] + new_deps + txt[j:]
+p.write_text(txt2, encoding="utf-8")
+PY
+          fi
+
+          # 2) Ensure Compose Foundation exists (KeyboardOptions lives in foundation)
+          if ! grep -q 'androidx.compose.foundation:foundation' "$APP_GRADLE"; then
+            echo "Adding Compose foundation dependency..."
+            python3 - <<'PY'
+import os, re, pathlib
+p = pathlib.Path(os.environ["APP_GRADLE"])
+txt = p.read_text(encoding="utf-8")
+
+m = re.search(r"dependencies\s*\{", txt)
+if not m:
+    raise SystemExit("No dependencies block found in app/build.gradle.kts")
+
+i = m.end()
+depth = 1
+j = i
+while j < len(txt) and depth > 0:
+    if txt[j] == "{": depth += 1
+    elif txt[j] == "}": depth -= 1
+    j += 1
+
+deps_block = txt[m.start():j]
+lines = deps_block.splitlines(True)
+
+insert = '    implementation("androidx.compose.foundation:foundation")\n'
+
+for idx, line in enumerate(lines):
+    if "dependencies" in line and "{" in line:
+        lines.insert(idx + 1, insert)
+        break
+
+new_deps = "".join(lines)
+txt2 = txt[:m.start()] + new_deps + txt[j:]
+p.write_text(txt2, encoding="utf-8")
+PY
+          fi
+
+          # 3) Fix KeyboardOptions import in SettingsScreen.kt (your error)
+          SETTINGS_FILE="$(find "$PROJECT_DIR" -type f -path "*/SettingsScreen.kt" | head -n 1 || true)"
+          if [ -n "$SETTINGS_FILE" ]; then
+            export SETTINGS_FILE
+            python3 - <<'PY'
+import os, pathlib
+p = pathlib.Path(os.environ["SETTINGS_FILE"])
+txt = p.read_text(encoding="utf-8")
+
+# Replace wrong package (if present) with correct one
+txt2 = txt.replace(
+    "import androidx.compose.ui.text.input.KeyboardOptions",
+    "import androidx.compose.foundation.text.KeyboardOptions"
+)
+
+if txt2 != txt:
+    p.write_text(txt2, encoding="utf-8")
+    print("✅ Patched KeyboardOptions import:", p)
+else:
+    print("ℹ️ No KeyboardOptions import patch needed.")
+PY
+          else
+            echo "ℹ️ SettingsScreen.kt not found (skipping import patch)."
+          fi
+
+          # Optional: suppress compileSdk warning (doesn't affect build success)
+          GP="$PROJECT_DIR/gradle.properties"
+          if [ -f "$GP" ] && ! grep -q '^android.suppressUnsupportedCompileSdk=36' "$GP"; then
+            echo 'android.suppressUnsupportedCompileSdk=36' >> "$GP"
+          fi
+
+      - name: Build Debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          ./gradlew --no-daemon clean :app:assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload reports (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/reports
+            ${{ env.PROJECT_DIR }}/build/reports
+          if-no-files-found: ignore
